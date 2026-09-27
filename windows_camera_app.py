@@ -164,8 +164,11 @@ CLICK_TRACK_BOX_WIDTH_RATIO = 0.22
 CLICK_TRACK_BOX_HEIGHT_RATIO = 0.42
 
 # Display size used by the two video panels.
-DISPLAY_WIDTH = 640
-DISPLAY_HEIGHT = 360
+# Render previews at a higher logical resolution, then scale them to the
+# available canvas. This keeps maximized-window previews crisp without making
+# the canvas/input coordinates depend on the current window size.
+DISPLAY_WIDTH = 960
+DISPLAY_HEIGHT = 540
 AI_CHECK_INTERVAL_SECONDS = 5.0
 AI_RECOVERY_CHECK_INTERVAL_SECONDS = 2.0
 AI_RECOVERY_WINDOW_SECONDS = 10.0
@@ -235,9 +238,18 @@ class PresenterCameraApp:
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("Presenter Camera Controller")
-        self.root.minsize(1100, 720)
+        self.root.title("Automatic Camera")
+        self.root.geometry("1440x900")
+        self.root.minsize(1180, 760)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self._configure_style()
+        icon_path = Path(__file__).with_name("assets") / "automatic-camera.ico"
+        if icon_path.exists():
+            try:
+                self.root.iconbitmap(default=str(icon_path))
+            except tk.TclError:
+                # Linux/macOS development environments may not support .ico.
+                pass
 
         self.capture: cv2.VideoCapture | None = None
         self.source_kind = ""
@@ -332,6 +344,8 @@ class PresenterCameraApp:
         self.smoothing = tk.DoubleVar(value=SMOOTHING_SPEED)
         self.follow_checkbutton: ttk.Checkbutton | None = None
         self.human_checkbutton: ttk.Checkbutton | None = None
+        self.header_status = tk.StringVar(value="READY  •  Select a source to begin")
+        self.status.trace_add("write", self._sync_header_status)
 
         self.build_menu()
         self.build_interface()
@@ -371,20 +385,93 @@ class PresenterCameraApp:
 
         self.root.config(menu=menu_bar)
 
+    def _configure_style(self) -> None:
+        """Set a restrained Windows-console palette without replacing ttk controls."""
+        style = ttk.Style(self.root)
+        try:
+            if "vista" in style.theme_names():
+                style.theme_use("vista")
+        except tk.TclError:
+            pass
+
+        self.root.configure(background="#eef2f7")
+        style.configure("App.TFrame", background="#eef2f7")
+        style.configure("Header.TFrame", background="#172333")
+        style.configure(
+            "HeaderTitle.TLabel",
+            background="#172333",
+            foreground="#f8fafc",
+            font=("Segoe UI", 13, "bold"),
+        )
+        style.configure(
+            "HeaderSub.TLabel",
+            background="#172333",
+            foreground="#a9b8c9",
+            font=("Segoe UI", 9),
+        )
+        style.configure(
+            "HeaderStatus.TLabel",
+            background="#172333",
+            foreground="#8ee6c2",
+            font=("Consolas", 9, "bold"),
+        )
+        style.configure(
+            "SectionTitle.TLabel",
+            background="#eef2f7",
+            foreground="#334155",
+            font=("Segoe UI", 9, "bold"),
+        )
+        style.configure(
+            "SectionHint.TLabel",
+            background="#eef2f7",
+            foreground="#64748b",
+            font=("Segoe UI", 8),
+        )
+
+    def _sync_header_status(self, *_args) -> None:
+        """Keep the compact header useful while the detailed status stays below."""
+        if not hasattr(self, "header_status"):
+            return
+        state = "LIVE" if self.running else "READY"
+        detail = self.status.get().strip()
+        if len(detail) > 72:
+            detail = f"{detail[:69]}..."
+        self.header_status.set(f"{state}  •  {detail}")
+
     def build_interface(self) -> None:
-        main = ttk.Frame(self.root, padding=8)
+        main = ttk.Frame(self.root, padding=10, style="App.TFrame")
         main.pack(fill=tk.BOTH, expand=True)
         main.columnconfigure(1, weight=1)
-        main.rowconfigure(0, weight=1)
+        main.rowconfigure(1, weight=1)
+
+        header = ttk.Frame(main, padding=(12, 9), style="Header.TFrame")
+        header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 9))
+        header.columnconfigure(1, weight=1)
+        ttk.Label(
+            header,
+            text="AUTOMATIC CAMERA",
+            style="HeaderTitle.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            header,
+            text="Presenter framing console  /  local tracking + AI assist",
+            style="HeaderSub.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Label(
+            header,
+            textvariable=self.header_status,
+            style="HeaderStatus.TLabel",
+            anchor="e",
+        ).grid(row=0, column=1, rowspan=2, sticky="e")
 
         controls_panel = ttk.Frame(main)
-        controls_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        controls_panel.grid(row=1, column=0, sticky="nsew", padx=(0, 10))
         controls_panel.columnconfigure(0, weight=1)
         controls_panel.rowconfigure(0, weight=1)
 
         controls_canvas = tk.Canvas(
             controls_panel,
-            width=315,
+            width=292,
             highlightthickness=0,
             borderwidth=0,
         )
@@ -759,17 +846,21 @@ class PresenterCameraApp:
             zoom_row, text="Zoom +", command=lambda: self.change_zoom(0.1)
         ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0))
 
-        displays = ttk.Frame(main)
-        displays.grid(row=0, column=1, sticky="nsew")
+        displays = ttk.Frame(main, style="App.TFrame")
+        displays.grid(row=1, column=1, sticky="nsew")
         displays.columnconfigure(0, weight=1)
         displays.columnconfigure(1, weight=1)
         displays.rowconfigure(1, weight=1)
         main.rowconfigure(2, weight=0)
 
-        ttk.Label(displays, text="Source Camera").grid(
+        ttk.Label(displays, text="SOURCE CAMERA", style="SectionTitle.TLabel").grid(
             row=0, column=0, sticky="w", padx=(0, 5), pady=(0, 4)
         )
-        ttk.Label(displays, text="Virtual Camera Output").grid(
+        ttk.Label(
+            displays,
+            text="VIRTUAL CAMERA OUTPUT",
+            style="SectionTitle.TLabel",
+        ).grid(
             row=0, column=1, sticky="w", padx=(5, 0), pady=(0, 4)
         )
 
@@ -779,7 +870,7 @@ class PresenterCameraApp:
             height=DISPLAY_HEIGHT // 2,
             background="black",
             highlightthickness=1,
-            highlightbackground="gray",
+            highlightbackground="#cbd5e1",
         )
         self.source_canvas.grid(row=1, column=0, sticky="nsew", padx=(0, 5))
         self.source_canvas.bind(
@@ -801,7 +892,7 @@ class PresenterCameraApp:
             height=DISPLAY_HEIGHT // 2,
             background="black",
             highlightthickness=1,
-            highlightbackground="gray",
+            highlightbackground="#cbd5e1",
         )
         self.virtual_canvas.grid(row=1, column=1, sticky="nsew", padx=(5, 0))
 
@@ -811,7 +902,7 @@ class PresenterCameraApp:
             padding=4,
         )
         terminal_frame.grid(
-            row=2,
+            row=3,
             column=0,
             columnspan=2,
             sticky="ew",
@@ -846,7 +937,7 @@ class PresenterCameraApp:
             anchor="w",
             padding=(5, 3),
         )
-        status_bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        status_bar.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
         self.source_type_changed()
         self.mode_changed(update_status=False)

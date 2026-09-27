@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Automatic Camera</title>
+  <desc id="desc">A camera with a tracking reticle lens.</desc>
+  <rect width="256" height="256" rx="48" fill="#172333"/>
+  <path d="M53 88c0-12.7 10.3-23 23-23h28l13-19h22l13 19h28c12.7 0 23 10.3 23 23v83c0 12.7-10.3 23-23 23H76c-12.7 0-23-10.3-23-23V88Z" fill="#2dd4bf"/>
+  <circle cx="128" cy="127" r="49" fill="#0f172a"/>
+  <circle cx="128" cy="127" r="31" fill="#38bdf8"/>
+  <circle cx="128" cy="127" r="20" fill="#172333"/>
+  <path d="M128 81v18M128 155v18M82 127h18M156 127h18" stroke="#f8fafc" stroke-width="7" stroke-linecap="round"/>
+  <circle cx="177" cy="91" r="7" fill="#f8fafc"/>
+</svg>

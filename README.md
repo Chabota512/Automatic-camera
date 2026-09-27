@@ -11,6 +11,8 @@ The project currently supports:
 - Optional local human tracking with OpenCV face detection
 - Manual control as a permanent fallback
 - A native-style Tkinter/ttk Windows interface
+- A compact Windows console layout with adaptive, high-resolution video panels
+- A camera/focus app icon for the window and packaged executable
 - Smooth pan/tilt motion and zoom
 - Independent Gemini and Groq analysis with staggered requests
 - Gemini image analysis through the official `google-genai` Python SDK
@@ -59,6 +61,10 @@ PyInstaller, and writes `dist\AutomaticCamera.exe`. The executable can be
 copied to another Windows machine; API keys still need to be configured there
 as environment variables. The first build requires an internet connection to
 install Python packages.
+
+The script also regenerates the multi-size icon in `assets\automatic-camera.ico`
+before packaging. The icon is intentionally simple so the camera and tracking
+reticle remain readable in the Windows taskbar and title bar.
 
 ## Run the desktop application
 
