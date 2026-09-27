@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+.pytest_cache/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local secrets and runtime configuration
+.env
+.env.*
+!.env.example
+
+# Local camera recordings
+*.mp4
+*.avi
+*.mov
+*.mkv

@@ -1,0 +1,5 @@
+numpy
+opencv-contrib-python
+pillow
+google-genai
+pytest
