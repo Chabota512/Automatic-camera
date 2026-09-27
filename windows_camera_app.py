@@ -22,11 +22,18 @@ import queue
 import json
 import threading
 import time
-import tkinter as tk
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+except ModuleNotFoundError:  # Allows non-GUI tracking tests on headless runners.
+    tk = None
+    filedialog = None
+    messagebox = None
+    ttk = None
 
 import cv2
 import numpy as np
