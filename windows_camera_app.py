@@ -37,7 +37,12 @@ except ModuleNotFoundError:  # Allows non-GUI tracking tests on headless runners
 
 import cv2
 import numpy as np
-from PIL import Image, ImageTk
+from PIL import Image
+
+try:
+    from PIL import ImageTk
+except ModuleNotFoundError:
+    ImageTk = None
 
 import target_tracking
 import vision_providers
