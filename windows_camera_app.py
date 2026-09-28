@@ -19,19 +19,152 @@ Run:
 from __future__ import annotations
 
 import queue
+import json
 import threading
 import time
-import tkinter as tk
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+except ModuleNotFoundError:  # Allows non-GUI tracking tests on headless runners.
+    tk = None
+    filedialog = None
+    messagebox = None
+    ttk = None
 
 import cv2
 import numpy as np
-from PIL import Image, ImageTk
+from PIL import Image
+
+try:
+    from PIL import ImageTk
+except ModuleNotFoundError:
+    ImageTk = None
 
 import target_tracking
 import vision_providers
+
+
+class NetworkExportServer:
+    """Serve the latest virtual-camera frame and motor coordinates over HTTP."""
+
+    def __init__(self, host: str = "0.0.0.0", port: int = 8765) -> None:
+        self._lock = threading.Lock()
+        self._coordinate_updates = threading.Condition(self._lock)
+        self._coordinate_version = 0
+        self._jpeg_bytes: bytes | None = None
+        self._coordinates: dict[str, object] = {}
+
+        export = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.path in {"/", "/index.html"}:
+                    self._send_page()
+                elif self.path == "/video.mjpg":
+                    self._send_video()
+                elif self.path == "/coordinates":
+                    self._send_coordinates()
+                elif self.path == "/coordinates/stream":
+                    self._send_coordinate_stream()
+                else:
+                    self.send_error(404)
+
+            def _send_page(self) -> None:
+                page = b"""<!doctype html>
+<html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Presenter Camera</title>
+<style>html,body{margin:0;background:#000;width:100%;height:100%;overflow:hidden}body{display:flex;align-items:center;justify-content:center}main{width:100vw;height:100vh;display:flex;align-items:center;justify-content:center;position:relative}img{display:block;width:100%;height:100%;object-fit:contain}button{position:fixed;right:16px;bottom:16px;padding:10px 14px;font:14px sans-serif;border:0;border-radius:4px;cursor:pointer}</style>
+</head><body><main id="feed"><img src="/video.mjpg" alt="Virtual camera feed"></main>
+<button onclick="document.getElementById('feed').requestFullscreen?.()">Fullscreen</button>
+</body></html>"""
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(page)))
+                self.end_headers()
+                self.wfile.write(page)
+
+            def _send_video(self) -> None:
+                self.send_response(200)
+                self.send_header(
+                    "Content-Type",
+                    "multipart/x-mixed-replace; boundary=frame",
+                )
+                self.end_headers()
+                while True:
+                    with export._lock:
+                        jpeg = export._jpeg_bytes
+                    if jpeg is not None:
+                        try:
+                            self.wfile.write(
+                                b"--frame\r\nContent-Type: image/jpeg\r\n"
+                                + f"Content-Length: {len(jpeg)}\r\n\r\n".encode()
+                                + jpeg
+                                + b"\r\n"
+                            )
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError, OSError):
+                            return
+                    time.sleep(0.1)
+
+            def _send_coordinates(self) -> None:
+                with export._lock:
+                    payload = dict(export._coordinates)
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _send_coordinate_stream(self) -> None:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-ndjson")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Connection", "keep-alive")
+                self.end_headers()
+                version = -1
+                while True:
+                    with export._coordinate_updates:
+                        export._coordinate_updates.wait_for(
+                            lambda: export._coordinate_version != version,
+                            timeout=2.0,
+                        )
+                        version = export._coordinate_version
+                        payload = dict(export._coordinates)
+                    try:
+                        self.wfile.write(json.dumps(payload).encode("utf-8") + b"\n")
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        return
+
+            def log_message(self, *_args) -> None:
+                return
+
+        self.httpd = ThreadingHTTPServer((host, port), Handler)
+        self.thread = threading.Thread(
+            target=self.httpd.serve_forever,
+            daemon=True,
+            name="presenter-camera-network-export",
+        )
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def update(self, jpeg_bytes: bytes, coordinates: dict[str, object]) -> None:
+        with self._coordinate_updates:
+            self._jpeg_bytes = jpeg_bytes
+            self._coordinates = dict(coordinates)
+            self._coordinate_version += 1
+            self._coordinate_updates.notify_all()
+
+    def stop(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
 
 
 # ========================= USER SETTINGS =========================
@@ -43,12 +176,17 @@ CLICK_TRACK_BOX_WIDTH_RATIO = 0.22
 CLICK_TRACK_BOX_HEIGHT_RATIO = 0.42
 
 # Display size used by the two video panels.
-DISPLAY_WIDTH = 640
-DISPLAY_HEIGHT = 360
+# Render previews at a higher logical resolution, then scale them to the
+# available canvas. This keeps maximized-window previews crisp without making
+# the canvas/input coordinates depend on the current window size.
+DISPLAY_WIDTH = 960
+DISPLAY_HEIGHT = 540
 AI_CHECK_INTERVAL_SECONDS = 5.0
+AI_RECOVERY_CHECK_INTERVAL_SECONDS = 2.0
+AI_RECOVERY_WINDOW_SECONDS = 10.0
 AI_PROVIDER_OFFSET_SECONDS = AI_CHECK_INTERVAL_SECONDS / 2
 AI_FRAME_MAX_DIMENSION = 640
-AI_BOX_MAX_AGE_SECONDS = AI_CHECK_INTERVAL_SECONDS * 2.5
+AI_BOX_MAX_AGE_SECONDS = 30.0
 AI_AUTO_ENABLE_ON_TRACK_LOSS = True
 VIDEO_LOG_INTERVAL_SECONDS = 1.0
 AI_TRANSIENT_ERROR_COOLDOWN_SECONDS = 10.0
@@ -61,6 +199,7 @@ HUMAN_DETECTION_INTERVAL_SECONDS = 0.20
 TARGET_REACQUIRE_INTERVAL_SECONDS = 0.20
 TARGET_REACQUIRE_TEMPLATE_THRESHOLD = 0.60
 TARGET_REACQUIRE_APPEARANCE_THRESHOLD = 0.40
+PORTRAIT_VERTICAL_FRAMING_BIAS = 0.12
 STREAM_OPEN_TIMEOUT_MS = 5000
 STREAM_READ_TIMEOUT_MS = 5000
 STARTUP_CAMERA_INDICES = range(5)
@@ -71,7 +210,7 @@ SHIFT_MASK = 0x0001
 # virtual-camera crop and yellow local tracker box.
 AI_BOX_COLORS = {
     "Gemini": (255, 220, 160),  # light blue
-    "Groq": (150, 185, 220),  # light brown
+    "Groq": (255, 0, 255),  # bright magenta
 }
 
 
@@ -111,9 +250,18 @@ class PresenterCameraApp:
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("Presenter Camera Controller")
-        self.root.minsize(1100, 720)
+        self.root.title("Automatic Camera")
+        self.root.geometry("1440x900")
+        self.root.minsize(1180, 760)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self._configure_style()
+        icon_path = Path(__file__).with_name("assets") / "automatic-camera.ico"
+        if icon_path.exists():
+            try:
+                self.root.iconbitmap(default=str(icon_path))
+            except tk.TclError:
+                # Linux/macOS development environments may not support .ico.
+                pass
 
         self.capture: cv2.VideoCapture | None = None
         self.source_kind = ""
@@ -123,7 +271,16 @@ class PresenterCameraApp:
 
         self.ai_results = queue.Queue()
         self.startup_check_results = queue.Queue()
+        self.camera_selection_results = queue.Queue()
         self.startup_check_vars: dict[str, tk.StringVar] = {}
+        self.startup_checks_pending = {"cameras", "cv", "Gemini", "Groq"}
+        self.startup_overlay: tk.Toplevel | None = None
+        self.startup_overlay_status: tk.StringVar | None = None
+        self.startup_spinner: ttk.Progressbar | None = None
+        self.startup_input_bindings: list[str] = []
+        self.startup_checks_cancelled = False
+        self.pending_camera_choices: tuple[tuple[int, ...], str] | None = None
+        self.camera_dialog: tk.Toplevel | None = None
         self.camera_probe_cancel = threading.Event()
         self.ai_threads: dict[str, threading.Thread] = {}
         self.ai_generation = 0
@@ -137,6 +294,8 @@ class PresenterCameraApp:
         self.ai_terminal_queue = queue.Queue()
         self.ai_last_video_log = 0.0
         self.video_frame_count = 0
+        self.network_export: NetworkExportServer | None = None
+        self.ai_recovery_deadline = 0.0
 
         self.tracker = None
         self.tracking_box: tuple[int, int, int, int] | None = None
@@ -161,7 +320,10 @@ class PresenterCameraApp:
         self.next_target_reacquire = 0.0
         self.auto_follow = tk.BooleanVar(value=True)
         self.mode = tk.StringVar(value="Assisted tracking")
-        self.ai_provider = tk.StringVar(value="Compare both")
+        self.ai_provider = tk.StringVar(value="Groq")
+        self.ai_target_priority = tk.StringVar(
+            value="face, person, presenter"
+        )
         self.ai_enabled = tk.BooleanVar(value=False)
         self.ai_indicator = tk.StringVar(value="AI: OFF")
         self.ai_toggle_button: ttk.Button | None = None
@@ -178,6 +340,7 @@ class PresenterCameraApp:
 
         self.source_image: ImageTk.PhotoImage | None = None
         self.virtual_image: ImageTk.PhotoImage | None = None
+        self.canvas_image_rectangles: dict[str, tuple[int, int, int, int]] = {}
 
         self.source_type = tk.StringVar(value="Android stream")
         self.stream_url = tk.StringVar(
@@ -188,14 +351,21 @@ class PresenterCameraApp:
         self.status = tk.StringVar(value="Ready. Select a source and click Start.")
         self.target_status = tk.StringVar(value="Target reference: none")
         self.human_status = tk.StringVar(value="Human tracking: OFF")
+        self.network_port = tk.StringVar(value="8765")
+        self.network_status = tk.StringVar(value="Network export: OFF")
         self.smoothing = tk.DoubleVar(value=SMOOTHING_SPEED)
         self.follow_checkbutton: ttk.Checkbutton | None = None
+        self.human_checkbutton: ttk.Checkbutton | None = None
+        self.header_status = tk.StringVar(value="READY  •  Select a source to begin")
+        self.status.trace_add("write", self._sync_header_status)
 
         self.build_menu()
         self.build_interface()
         self.bind_controls()
+        self._show_startup_overlay()
         self.root.after(100, self._drain_terminal_queue)
         self.root.after(100, self._drain_startup_check_results)
+        self.root.after(100, self._drain_camera_selection_results)
         self.root.after(300, self._start_startup_checks)
 
     def build_menu(self) -> None:
@@ -227,9 +397,62 @@ class PresenterCameraApp:
 
         self.root.config(menu=menu_bar)
 
+    def _configure_style(self) -> None:
+        """Set a restrained Windows-console palette without replacing ttk controls."""
+        style = ttk.Style(self.root)
+        try:
+            if "vista" in style.theme_names():
+                style.theme_use("vista")
+        except tk.TclError:
+            pass
+
+        self.root.configure(background="#eef2f7")
+        style.configure("App.TFrame", background="#eef2f7")
+        style.configure("Header.TFrame", background="#172333")
+        style.configure(
+            "HeaderTitle.TLabel",
+            background="#172333",
+            foreground="#f8fafc",
+            font=("Segoe UI", 13, "bold"),
+        )
+        style.configure(
+            "HeaderSub.TLabel",
+            background="#172333",
+            foreground="#a9b8c9",
+            font=("Segoe UI", 9),
+        )
+        style.configure(
+            "HeaderStatus.TLabel",
+            background="#172333",
+            foreground="#8ee6c2",
+            font=("Consolas", 9, "bold"),
+        )
+        style.configure(
+            "SectionTitle.TLabel",
+            background="#eef2f7",
+            foreground="#334155",
+            font=("Segoe UI", 9, "bold"),
+        )
+        style.configure(
+            "SectionHint.TLabel",
+            background="#eef2f7",
+            foreground="#64748b",
+            font=("Segoe UI", 8),
+        )
+
+    def _sync_header_status(self, *_args) -> None:
+        """Keep the compact header useful while the detailed status stays below."""
+        if not hasattr(self, "header_status"):
+            return
+        state = "LIVE" if self.running else "READY"
+        detail = self.status.get().strip()
+        if len(detail) > 72:
+            detail = f"{detail[:69]}..."
+        self.header_status.set(f"{state}  •  {detail}")
+
     def build_interface(self) -> None:
-        # The application deliberately stays native Tk, but uses a restrained
-        # control-room palette rather than the platform default theme.
+        # Keep the native Tk surface, but use a focused operator-console
+        # palette instead of the platform default theme.
         style = ttk.Style(self.root)
         try:
             style.theme_use("clam")
@@ -250,60 +473,98 @@ class PresenterCameraApp:
         style.configure("TFrame", background=colors["bg"])
         style.configure("Panel.TFrame", background=colors["panel"])
         style.configure(
-            "TLabel", background=colors["panel"], foreground=colors["text"],
+            "TLabel",
+            background=colors["panel"],
+            foreground=colors["text"],
             font=("Segoe UI", 9),
         )
         style.configure(
-            "Muted.TLabel", background=colors["bg"], foreground=colors["muted"],
+            "Muted.TLabel",
+            background=colors["bg"],
+            foreground=colors["muted"],
             font=("Segoe UI", 8),
         )
         style.configure(
-            "Title.TLabel", background=colors["panel_alt"], foreground="#f0f5f1",
-            font=("Segoe UI", 13, "bold"),
+            "Section.TLabelframe",
+            background=colors["panel"],
+            foreground=colors["muted"],
+            bordercolor=colors["line"],
+            relief="solid",
+            borderwidth=1,
         )
         style.configure(
-            "Section.TLabelframe", background=colors["panel"],
-            foreground=colors["muted"], bordercolor=colors["line"],
-            relief="solid", borderwidth=1,
+            "Section.TLabelframe.Label",
+            background=colors["panel"],
+            foreground=colors["muted"],
+            font=("Segoe UI", 8, "bold"),
         )
         style.configure(
-            "Section.TLabelframe.Label", background=colors["panel"],
-            foreground=colors["muted"], font=("Segoe UI", 8, "bold"),
-        )
-        style.configure(
-            "TButton", background="#26322f", foreground=colors["text"],
-            bordercolor=colors["line"], padding=(8, 5),
+            "TButton",
+            background="#26322f",
+            foreground=colors["text"],
+            bordercolor=colors["line"],
+            padding=(8, 5),
         )
         style.map(
-            "TButton", background=[("active", "#33443d")],
+            "TButton",
+            background=[("active", "#33443d")],
             foreground=[("disabled", "#61716a")],
         )
         style.configure(
-            "Accent.TButton", background=colors["lime"], foreground="#182019",
-            font=("Segoe UI", 9, "bold"), padding=(9, 6),
+            "Accent.TButton",
+            background=colors["lime"],
+            foreground="#182019",
+            font=("Segoe UI", 9, "bold"),
+            padding=(9, 6),
         )
         style.map("Accent.TButton", background=[("active", "#d7fa79")])
         style.configure(
-            "TCombobox", fieldbackground="#202b30", background="#26322f",
-            foreground=colors["text"], arrowcolor=colors["lime"],
+            "TEntry",
+            fieldbackground="#202b30",
+            foreground=colors["text"],
+            insertcolor=colors["text"],
         )
-        style.configure("TCheckbutton", background=colors["panel"], foreground=colors["text"])
-        style.configure("Horizontal.TScale", background=colors["panel"], troughcolor="#334039")
+        style.configure(
+            "TCombobox",
+            fieldbackground="#202b30",
+            background="#26322f",
+            foreground=colors["text"],
+            arrowcolor=colors["lime"],
+        )
+        style.configure(
+            "TCheckbutton",
+            background=colors["panel"],
+            foreground=colors["text"],
+        )
+        style.configure(
+            "Horizontal.TScale",
+            background=colors["panel"],
+            troughcolor="#334039",
+        )
 
         header = tk.Frame(self.root, bg=colors["panel_alt"], height=56)
         header.pack(fill=tk.X)
         header.pack_propagate(False)
         tk.Label(
-            header, text="AUTOMATIC CAMERA", bg=colors["panel_alt"],
-            fg=colors["lime"], font=("Segoe UI", 12, "bold"),
+            header,
+            text="AUTOMATIC CAMERA",
+            bg=colors["panel_alt"],
+            fg=colors["lime"],
+            font=("Segoe UI", 12, "bold"),
         ).pack(side=tk.LEFT, padx=(18, 8))
         tk.Label(
-            header, text="CONTROL ROOM  /  local camera operator console",
-            bg=colors["panel_alt"], fg=colors["muted"], font=("Segoe UI", 9),
+            header,
+            text="CONTROL ROOM  /  local camera operator console",
+            bg=colors["panel_alt"],
+            fg=colors["muted"],
+            font=("Segoe UI", 9),
         ).pack(side=tk.LEFT)
         tk.Label(
-            header, text="SYSTEM READY", bg=colors["panel_alt"],
-            fg=colors["lime"], font=("Segoe UI", 9, "bold"),
+            header,
+            textvariable=self.header_status,
+            bg=colors["panel_alt"],
+            fg=colors["lime"],
+            font=("Segoe UI", 9, "bold"),
         ).pack(side=tk.RIGHT, padx=18)
 
         main = ttk.Frame(self.root, padding=(14, 12, 14, 0))
@@ -334,7 +595,9 @@ class PresenterCameraApp:
         controls_canvas.configure(yscrollcommand=controls_scrollbar.set)
 
         controls = ttk.Frame(
-            controls_canvas, padding=(0, 0, 10, 0), style="Panel.TFrame"
+            controls_canvas,
+            padding=(0, 0, 10, 0),
+            style="Panel.TFrame",
         )
         controls_window = controls_canvas.create_window(
             (0, 0),
@@ -403,7 +666,9 @@ class PresenterCameraApp:
         )
 
         source_frame = ttk.LabelFrame(
-            controls, text="SOURCE SELECTION  /  INPUT", padding=8,
+            controls,
+            text="SOURCE SELECTION  /  INPUT",
+            padding=8,
             style="Section.TLabelframe",
         )
         source_frame.pack(fill=tk.X)
@@ -447,7 +712,9 @@ class PresenterCameraApp:
         source_buttons = ttk.Frame(source_frame)
         source_buttons.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         self.start_button = ttk.Button(
-            source_buttons, text="Start", command=self.start_source,
+            source_buttons,
+            text="Start",
+            command=self.start_source,
             style="Accent.TButton",
         )
         self.start_button.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -456,8 +723,42 @@ class PresenterCameraApp:
         )
         self.stop_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
 
+        network_frame = ttk.LabelFrame(
+            controls,
+            text="Network export",
+            padding=8,
+        )
+        network_frame.pack(fill=tk.X, pady=(10, 0))
+        network_frame.columnconfigure(1, weight=1)
+        ttk.Label(network_frame, text="Port:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(
+            network_frame,
+            textvariable=self.network_port,
+            width=8,
+        ).grid(row=0, column=1, sticky="w", padx=(6, 0))
+        self.network_button = ttk.Button(
+            network_frame,
+            text="Start network export",
+            command=self.toggle_network_export,
+        )
+        self.network_button.grid(
+            row=1,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=(6, 4),
+        )
+        ttk.Label(
+            network_frame,
+            textvariable=self.network_status,
+            justify=tk.LEFT,
+            wraplength=230,
+        ).grid(row=2, column=0, columnspan=2, sticky="w")
+
         tracking_frame = ttk.LabelFrame(
-            controls, text="CONTROL MODE  /  TRACKING", padding=8,
+            controls,
+            text="CONTROL MODE  /  TRACKING",
+            padding=8,
             style="Section.TLabelframe",
         )
         tracking_frame.pack(fill=tk.X, pady=(10, 0))
@@ -468,6 +769,7 @@ class PresenterCameraApp:
             values=(
                 "Manual control",
                 "Assisted tracking",
+                "Face tracking",
                 "Automatic AI",
             ),
             state="readonly",
@@ -547,6 +849,16 @@ class PresenterCameraApp:
             command=self.toggle_ai,
         )
         self.ai_toggle_button.pack(fill=tk.X, pady=(0, 7))
+        ttk.Button(
+            tracking_frame,
+            text="Priorities",
+            command=self.show_priority_dialog,
+        ).pack(fill=tk.X, pady=(0, 7))
+        ttk.Button(
+            tracking_frame,
+            text="Rescan AI",
+            command=self.rescan_ai,
+        ).pack(fill=tk.X, pady=(0, 7))
 
         self.follow_checkbutton = ttk.Checkbutton(
             tracking_frame,
@@ -554,12 +866,13 @@ class PresenterCameraApp:
             variable=self.auto_follow,
         )
         self.follow_checkbutton.pack(anchor="w")
-        ttk.Checkbutton(
+        self.human_checkbutton = ttk.Checkbutton(
             tracking_frame,
             text="Track human (local face detection)",
             variable=self.track_human,
             command=self.human_tracking_changed,
-        ).pack(anchor="w", pady=(5, 0))
+        )
+        self.human_checkbutton.pack(anchor="w", pady=(5, 0))
         ttk.Label(
             tracking_frame,
             textvariable=self.human_status,
@@ -620,7 +933,9 @@ class PresenterCameraApp:
             ).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         motion_frame = ttk.LabelFrame(
-            controls, text="CAMERA CONTROL  /  OPERATOR", padding=8,
+            controls,
+            text="CAMERA CONTROL  /  OPERATOR",
+            padding=8,
             style="Section.TLabelframe",
         )
         motion_frame.pack(fill=tk.X, pady=(10, 0))
@@ -640,19 +955,19 @@ class PresenterCameraApp:
         button_pad = ttk.Frame(motion_frame)
         button_pad.pack(pady=(8, 0))
         ttk.Button(
-            button_pad, text="UP", width=5, command=lambda: self.nudge(0, -1)
+            button_pad, text="▲", width=5, command=lambda: self.nudge(0, -1)
         ).grid(row=0, column=1, padx=2, pady=2)
         ttk.Button(
-            button_pad, text="LEFT", width=5, command=lambda: self.nudge(-1, 0)
+            button_pad, text="◀", width=5, command=lambda: self.nudge(-1, 0)
         ).grid(row=1, column=0, padx=2, pady=2)
         ttk.Button(
             button_pad, text="Reset", width=5, command=self.reset_camera
         ).grid(row=1, column=1, padx=2, pady=2)
         ttk.Button(
-            button_pad, text="RIGHT", width=5, command=lambda: self.nudge(1, 0)
+            button_pad, text="▶", width=5, command=lambda: self.nudge(1, 0)
         ).grid(row=1, column=2, padx=2, pady=2)
         ttk.Button(
-            button_pad, text="DOWN", width=5, command=lambda: self.nudge(0, 1)
+            button_pad, text="▼", width=5, command=lambda: self.nudge(0, 1)
         ).grid(row=2, column=1, padx=2, pady=2)
 
         zoom_row = ttk.Frame(motion_frame)
@@ -664,39 +979,73 @@ class PresenterCameraApp:
             zoom_row, text="Zoom +", command=lambda: self.change_zoom(0.1)
         ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0))
 
-        displays = ttk.Frame(main)
+        displays = ttk.Frame(main, style="Panel.TFrame")
         displays.grid(row=0, column=0, sticky="nsew")
         displays.columnconfigure(0, weight=1)
         displays.columnconfigure(1, weight=1)
         displays.rowconfigure(1, weight=1)
         main.rowconfigure(2, weight=0)
 
-        source_heading = tk.Frame(displays, bg=colors["panel"], height=38)
-        source_heading.grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=(0, 4))
+        source_heading = tk.Frame(
+            displays,
+            bg=colors["panel"],
+            height=38,
+        )
+        source_heading.grid(
+            row=0,
+            column=0,
+            sticky="ew",
+            padx=(0, 6),
+            pady=(0, 4),
+        )
         source_heading.pack_propagate(False)
         tk.Label(
-            source_heading, text="SOURCE CAMERA", bg=colors["panel"],
-            fg=colors["lime"], font=("Segoe UI", 10, "bold"),
+            source_heading,
+            text="SOURCE CAMERA",
+            bg=colors["panel"],
+            fg=colors["lime"],
+            font=("Segoe UI", 10, "bold"),
         ).pack(side=tk.LEFT, padx=12)
         tk.Label(
-            source_heading, text="INPUT / A     1080p  ·  LIVE",
-            bg=colors["panel"], fg=colors["muted"], font=("Consolas", 8),
+            source_heading,
+            text="INPUT / A     1080p  ·  LIVE",
+            bg=colors["panel"],
+            fg=colors["muted"],
+            font=("Consolas", 8),
         ).pack(side=tk.RIGHT, padx=12)
-        output_heading = tk.Frame(displays, bg=colors["panel"], height=38)
-        output_heading.grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=(0, 4))
+
+        output_heading = tk.Frame(
+            displays,
+            bg=colors["panel"],
+            height=38,
+        )
+        output_heading.grid(
+            row=0,
+            column=1,
+            sticky="ew",
+            padx=(6, 0),
+            pady=(0, 4),
+        )
         output_heading.pack_propagate(False)
         tk.Label(
-            output_heading, text="VIRTUAL CAMERA OUTPUT", bg=colors["panel"],
-            fg=colors["coral"], font=("Segoe UI", 10, "bold"),
+            output_heading,
+            text="VIRTUAL CAMERA OUTPUT",
+            bg=colors["panel"],
+            fg=colors["coral"],
+            font=("Segoe UI", 10, "bold"),
         ).pack(side=tk.LEFT, padx=12)
         tk.Label(
-            output_heading, text="OUTPUT / VIRTUAL     60 FPS",
-            bg=colors["panel"], fg=colors["muted"], font=("Consolas", 8),
+            output_heading,
+            text="OUTPUT / VIRTUAL     60 FPS",
+            bg=colors["panel"],
+            fg=colors["muted"],
+            font=("Consolas", 8),
         ).pack(side=tk.RIGHT, padx=12)
+
         self.source_canvas = tk.Canvas(
             displays,
-            width=DISPLAY_WIDTH,
-            height=DISPLAY_HEIGHT,
+            width=DISPLAY_WIDTH // 2,
+            height=DISPLAY_HEIGHT // 2,
             background="#202b30",
             highlightthickness=1,
             highlightbackground="#52645d",
@@ -717,16 +1066,26 @@ class PresenterCameraApp:
 
         self.virtual_canvas = tk.Canvas(
             displays,
-            width=DISPLAY_WIDTH,
-            height=DISPLAY_HEIGHT,
+            width=DISPLAY_WIDTH // 2,
+            height=DISPLAY_HEIGHT // 2,
             background="#202b30",
             highlightthickness=1,
             highlightbackground="#52645d",
         )
         self.virtual_canvas.grid(row=1, column=1, sticky="nsew", padx=(5, 0))
 
-        telemetry = tk.Frame(displays, bg=colors["panel"], height=56)
-        telemetry.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        telemetry = tk.Frame(
+            displays,
+            bg=colors["panel"],
+            height=56,
+        )
+        telemetry.grid(
+            row=2,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=(10, 0),
+        )
         telemetry.grid_propagate(False)
         telemetry_items = (
             ("TRACKING", "TARGET LOCKED", colors["lime"]),
@@ -739,11 +1098,17 @@ class PresenterCameraApp:
             cell = tk.Frame(telemetry, bg=colors["panel"])
             cell.grid(row=0, column=index, sticky="nsew", padx=10, pady=8)
             tk.Label(
-                cell, text=label, bg=colors["panel"], fg=colors["muted"],
+                cell,
+                text=label,
+                bg=colors["panel"],
+                fg=colors["muted"],
                 font=("Segoe UI", 7, "bold"),
             ).pack(anchor="w")
             tk.Label(
-                cell, text=value, bg=colors["panel"], fg=color,
+                cell,
+                text=value,
+                bg=colors["panel"],
+                fg=color,
                 font=("Consolas", 9, "bold"),
             ).pack(anchor="w", pady=(3, 0))
 
@@ -751,6 +1116,7 @@ class PresenterCameraApp:
             main,
             text="LIVE DIAGNOSTICS  /  ALSO PRINTED TO POWERSHELL OR CMD",
             padding=4,
+            style="Section.TLabelframe",
         )
         terminal_frame.grid(
             row=2,
@@ -781,23 +1147,113 @@ class PresenterCameraApp:
         terminal_scrollbar.grid(row=0, column=1, sticky="ns")
         self.terminal.configure(yscrollcommand=terminal_scrollbar.set)
 
-        footer = tk.Frame(self.root, bg=colors["panel_alt"], height=30)
+        footer = tk.Frame(
+            self.root,
+            bg=colors["panel_alt"],
+            height=30,
+        )
         footer.pack(fill=tk.X, side=tk.BOTTOM)
         footer.pack_propagate(False)
-        self.status = self.status  # Preserve the public status variable.
-        status_bar = tk.Label(
-            footer, textvariable=self.status, bg=colors["panel_alt"],
-            fg=colors["muted"], anchor="w", font=("Consolas", 8),
-        )
-        status_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=14)
         tk.Label(
-            footer, text="LOCAL PROCESSING  ·  NET 46 MS  ·  BUILD 0.9.4-BETA",
-            bg=colors["panel_alt"], fg=colors["muted"], font=("Consolas", 8),
+            footer,
+            textvariable=self.status,
+            bg=colors["panel_alt"],
+            fg=colors["muted"],
+            anchor="w",
+            font=("Consolas", 8),
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=14)
+        tk.Label(
+            footer,
+            text="LOCAL PROCESSING  ·  NET 46 MS  ·  BUILD 0.9.4-BETA",
+            bg=colors["panel_alt"],
+            fg=colors["muted"],
+            font=("Consolas", 8),
         ).pack(side=tk.RIGHT, padx=14)
 
         self.source_type_changed()
         self.mode_changed(update_status=False)
         self._refresh_provider_statuses()
+
+    def _show_startup_overlay(self) -> None:
+        """Block interaction while the asynchronous startup checks run."""
+        overlay = tk.Toplevel(self.root)
+        overlay.title("System getting ready")
+        overlay.transient(self.root)
+        overlay.resizable(False, False)
+        overlay.protocol("WM_DELETE_WINDOW", lambda: None)
+        overlay.update_idletasks()
+        popup_width = 430
+        popup_height = 150
+        root_x = self.root.winfo_x()
+        root_y = self.root.winfo_y()
+        root_width = self.root.winfo_width()
+        root_height = self.root.winfo_height()
+        popup_x = root_x + max(0, (root_width - popup_width) // 2)
+        popup_y = root_y + max(0, (root_height - popup_height) // 2)
+        overlay.geometry(f"{popup_width}x{popup_height}+{popup_x}+{popup_y}")
+        overlay.lift()
+
+        panel = ttk.Frame(overlay, padding=18)
+        panel.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            panel,
+            text="System getting ready...",
+        ).pack(pady=(0, 8))
+        self.startup_overlay_status = tk.StringVar(
+            value="Checking cameras, computer vision, and AI providers..."
+        )
+        ttk.Label(
+            panel,
+            textvariable=self.startup_overlay_status,
+        ).pack(pady=(0, 12))
+        self.startup_spinner = ttk.Progressbar(
+            panel,
+            mode="indeterminate",
+            length=280,
+        )
+        self.startup_spinner.pack()
+        self.startup_spinner.start(12)
+        ttk.Button(
+            panel,
+            text="Cancel",
+            command=self.cancel_startup_checks,
+        ).pack(pady=(12, 0))
+
+        self.startup_overlay = overlay
+        for sequence in ("<Button>", "<Key>", "<Motion>"):
+            overlay.bind_all(sequence, lambda _event: "break", add="+")
+            self.startup_input_bindings.append(sequence)
+        overlay.grab_set()
+
+    def cancel_startup_checks(self) -> None:
+        """Stop startup probing and release the app for manual use."""
+        self.startup_checks_cancelled = True
+        self.camera_probe_cancel.set()
+        self.startup_checks_pending.clear()
+        self.pending_camera_choices = None
+        self._hide_startup_overlay()
+        self.status.set("Startup checks cancelled. Select a source manually.")
+
+    def _hide_startup_overlay(self) -> None:
+        if self.startup_overlay is None:
+            return
+        for sequence in self.startup_input_bindings:
+            self.root.unbind_all(sequence)
+        self.startup_input_bindings.clear()
+        try:
+            self.startup_overlay.grab_release()
+        except tk.TclError:
+            pass
+        if self.startup_spinner is not None:
+            self.startup_spinner.stop()
+        self.startup_overlay.destroy()
+        self.startup_overlay = None
+        self.startup_overlay_status = None
+        self.status.set("System initialized. Select a source or use the camera dialog.")
+        if self.pending_camera_choices is not None:
+            webcam_indices, stream_state = self.pending_camera_choices
+            self.pending_camera_choices = None
+            self._show_camera_choices(webcam_indices, stream_state)
 
     def ai_provider_changed(self, _event=None) -> None:
         """Restart the selected provider clocks without disabling AI."""
@@ -862,15 +1318,32 @@ class PresenterCameraApp:
         elif selected_mode == "Assisted tracking":
             if self.follow_checkbutton is not None:
                 self.follow_checkbutton.configure(state="normal")
+            if self.human_checkbutton is not None:
+                self.human_checkbutton.configure(state="normal")
             self.auto_follow.set(True)
             if update_status:
                 self.status.set(
                     "Assisted mode active. Click an object to track it."
                 )
+        elif selected_mode == "Face tracking":
+            self.track_human.set(True)
+            if self.human_checkbutton is not None:
+                self.human_checkbutton.configure(state="disabled")
+            if self.follow_checkbutton is not None:
+                self.follow_checkbutton.configure(state="disabled")
+            self.auto_follow.set(True)
+            self.next_human_detection = 0.0
+            self._update_human_status()
+            if update_status:
+                self.status.set(
+                    "Face tracking active. The largest visible face controls the camera."
+                )
         else:
             self.auto_follow.set(True)
             if self.follow_checkbutton is not None:
                 self.follow_checkbutton.configure(state="disabled")
+            if self.human_checkbutton is not None:
+                self.human_checkbutton.configure(state="normal")
             self._schedule_ai_requests(immediate=True)
             if self.ai_enabled.get():
                 self.update_ai_indicator(True)
@@ -1021,14 +1494,32 @@ class PresenterCameraApp:
         )
         self._refresh_provider_statuses()
 
+    def rescan_ai(self) -> None:
+        """Force enabled providers to analyze the next available frame."""
+        if not self.ai_enabled.get():
+            self.ai_enabled.set(True)
+            self.mode.set("Automatic AI")
+            self.ai_generation += 1
+            self.mode_changed(update_status=False)
+            self.update_ai_indicator(True, "AI: ON • rescanning")
+
+        now = time.monotonic()
+        enabled = set(self._enabled_providers())
+        for provider, runtime in self.ai_runtime.items():
+            if provider in enabled and not runtime.in_flight:
+                runtime.next_check = now
+                runtime.last_error = ""
+
+        self.status.set("AI rescan requested. Analyzing the next camera frame.")
+        self._log(
+            "AI rescan requested; enabled providers are due on the next frame."
+        )
+        self._refresh_provider_statuses()
+
     def _start_ai_after_tracking_loss(self) -> None:
         if not AI_AUTO_ENABLE_ON_TRACK_LOSS:
             return
 
-        previous_deadlines = {
-            provider: runtime.next_check
-            for provider, runtime in self.ai_runtime.items()
-        }
         if not self.ai_enabled.get():
             self.ai_enabled.set(True)
             self.ai_generation += 1
@@ -1036,33 +1527,21 @@ class PresenterCameraApp:
         self.mode_changed(update_status=False)
 
         now = time.monotonic()
+        if not self.tracking_lost or self.ai_recovery_deadline <= now:
+            self.ai_recovery_deadline = now + AI_RECOVERY_WINDOW_SECONDS
         enabled = self._enabled_providers()
         for provider, runtime in self.ai_runtime.items():
             if provider not in enabled:
                 continue
-            stagger = (
-                AI_PROVIDER_OFFSET_SECONDS
-                if provider == "Groq" and len(enabled) == 2
-                else 0.0
-            )
-            runtime.next_check = now + stagger
-            if (
-                runtime.consecutive_failures
-                and previous_deadlines[provider] > now
-            ):
-                runtime.next_check = max(
-                    runtime.next_check,
-                    previous_deadlines[provider],
-                )
+            runtime.next_check = now
 
         self.update_ai_indicator(True, "AI: ON • tracking-loss fallback")
         self.status.set(
-            "Local tracking lost. AI is analyzing the loss frame; provider "
-            "cooldowns are respected."
+            "Local tracking lost. AI is analyzing the loss frame immediately."
         )
         self._log(
             "Local tracker lost; AI fallback enabled for the current JPEG "
-            "frame. Existing provider cooldowns are preserved."
+            "frame and recovery requests are due every 2 seconds for 10 seconds."
         )
         self._refresh_provider_statuses()
 
@@ -1133,6 +1612,15 @@ class PresenterCameraApp:
             return
 
         now = time.monotonic()
+        recovery_active = (
+            self.tracking_lost
+            and now < self.ai_recovery_deadline
+        )
+        request_interval = (
+            AI_RECOVERY_CHECK_INTERVAL_SECONDS
+            if recovery_active
+            else AI_CHECK_INTERVAL_SECONDS
+        )
         due_providers = [
             provider
             for provider in self._enabled_providers()
@@ -1151,7 +1639,7 @@ class PresenterCameraApp:
         if not ok:
             for provider in due_providers:
                 self.ai_runtime[provider].next_check = (
-                    now + AI_CHECK_INTERVAL_SECONDS
+                    now + request_interval
                 )
                 self.ai_runtime[provider].last_error = (
                     "Current frame could not be JPEG encoded."
@@ -1162,6 +1650,7 @@ class PresenterCameraApp:
 
         jpeg_bytes = encoded.tobytes()
         reference_jpeg_bytes = self._reference_jpeg_bytes()
+        target_priority = self.ai_target_priority.get().strip()
         generation = self.ai_generation
         frame_height, frame_width = frame.shape[:2]
         context = AIFrameContext(
@@ -1174,7 +1663,7 @@ class PresenterCameraApp:
             runtime = self.ai_runtime[provider]
             runtime.in_flight = True
             runtime.last_started = now
-            runtime.next_check = now + AI_CHECK_INTERVAL_SECONDS
+            runtime.next_check = now + request_interval
             runtime.request_count += 1
             thread = threading.Thread(
                 target=self._run_ai_request,
@@ -1183,6 +1672,7 @@ class PresenterCameraApp:
                     provider,
                     jpeg_bytes,
                     reference_jpeg_bytes,
+                    target_priority,
                     context,
                 ),
                 daemon=True,
@@ -1205,12 +1695,14 @@ class PresenterCameraApp:
         provider: str,
         jpeg_bytes: bytes,
         reference_jpeg_bytes: bytes | None,
+        target_priority: str,
         context: AIFrameContext,
     ) -> None:
         try:
             result = vision_providers.create_provider(provider).locate_presenter(
                 jpeg_bytes,
                 reference_jpeg_bytes,
+                target_priority,
             )
         except Exception as error:
             self.ai_results.put((generation, provider, "error", error, context))
@@ -1326,6 +1818,8 @@ class PresenterCameraApp:
             max(20, int(round(box_width * frame_width / 1000))),
             max(20, int(round(box_height * frame_height / 1000))),
         )
+        if self.track_human.get():
+            pixel_box = self._refine_ai_box_with_face(pixel_box)
         if not self.valid_tracking_box(
             pixel_box,
             frame_width,
@@ -1347,6 +1841,7 @@ class PresenterCameraApp:
         if (
             match_score is not None
             and match_score < TARGET_MATCH_REJECT_THRESHOLD
+            and not self.tracking_lost
         ):
             runtime.last_box = None
             runtime.last_human_match_score = None
@@ -1591,6 +2086,59 @@ class PresenterCameraApp:
             self.smile_boxes,
         )
 
+    def _refine_ai_box_with_face(
+        self,
+        candidate_box: tuple[int, int, int, int],
+    ) -> tuple[int, int, int, int]:
+        """Combine an AI head box with the nearest local face box."""
+        if not self.face_boxes:
+            return candidate_box
+
+        candidate_x, candidate_y, candidate_width, candidate_height = candidate_box
+        candidate_center = (
+            candidate_x + candidate_width / 2,
+            candidate_y + candidate_height / 2,
+        )
+        ranked_faces = []
+        for face_box in self.face_boxes:
+            face_x, face_y, face_width, face_height = face_box
+            face_center = (
+                face_x + face_width / 2,
+                face_y + face_height / 2,
+            )
+            distance = (
+                (face_center[0] - candidate_center[0]) ** 2
+                + (face_center[1] - candidate_center[1]) ** 2
+            ) ** 0.5
+            overlap = target_tracking.box_iou(candidate_box, face_box)
+            ranked_faces.append((overlap, -distance, face_box))
+
+        overlap, negative_distance, face_box = max(ranked_faces)
+        max_distance = max(candidate_width, candidate_height) * 1.5
+        if overlap <= 0 and -negative_distance > max_distance:
+            return candidate_box
+
+        left = min(candidate_x, face_box[0])
+        top = min(candidate_y, face_box[1])
+        right = max(candidate_x + candidate_width, face_box[0] + face_box[2])
+        bottom = max(candidate_y + candidate_height, face_box[1] + face_box[3])
+        margin_x = max(4, int(round((right - left) * 0.08)))
+        margin_y = max(4, int(round((bottom - top) * 0.08)))
+        refined = (
+            max(0, left - margin_x),
+            max(0, top - margin_y),
+            min(self.frame.shape[1], right + margin_x)
+            - max(0, left - margin_x),
+            min(self.frame.shape[0], bottom + margin_y)
+            - max(0, top - margin_y),
+        )
+        self._log(
+            f"AI head box refined with local face: "
+            f"({candidate_x},{candidate_y},{candidate_width},{candidate_height}) "
+            f"-> ({refined[0]},{refined[1]},{refined[2]},{refined[3]})"
+        )
+        return refined
+
     def human_tracking_changed(self) -> None:
         """Toggle the optional local face signal without changing target state."""
         self.next_human_detection = 0.0
@@ -1729,6 +2277,38 @@ class PresenterCameraApp:
             self._log(f"Local face detection unavailable: {error}")
         self._update_human_match()
 
+    def _maybe_start_human_tracking(self) -> None:
+        """Start local camera following when face mode has no target yet."""
+        if (
+            not self.track_human.get()
+            or self.mode.get() == "Automatic AI"
+            or self.target_reference is not None
+            or self.tracker is not None
+            or self.frame is None
+            or not self.face_boxes
+        ):
+            return
+
+        candidate_box = max(
+            self.face_boxes,
+            key=lambda box: box[2] * box[3],
+        )
+        self.auto_follow.set(True)
+        self._initialize_local_tracker(candidate_box)
+        if self.tracker is None:
+            return
+        self.tracking_lost = False
+        self.target_x, self.target_y = self._box_center(candidate_box)
+        self._capture_target_reference(candidate_box, target_kind="human")
+        self.status.set(
+            "Local human tracking acquired the largest visible face."
+        )
+        self._log(
+            f"Local human tracking acquired face: "
+            f"box=({candidate_box[0]},{candidate_box[1]} "
+            f"{candidate_box[2]}x{candidate_box[3]})"
+        )
+
     def _update_human_match(self) -> None:
         """Re-score the current target against the latest detected faces."""
         if not self.track_human.get() or self.tracking_box is None:
@@ -1788,6 +2368,182 @@ class PresenterCameraApp:
             ),
         ):
             self.status.set("Target reference refreshed from the current frame.")
+
+    def show_priority_dialog(self) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title("AI priorities")
+        dialog.transient(self.root)
+        dialog.resizable(True, True)
+        dialog.minsize(380, 300)
+        body = ttk.Frame(dialog, padding=16)
+        body.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            body,
+            text="AI target priorities",
+            font=("Segoe UI", 12, "bold"),
+        ).pack(anchor="w")
+        ttk.Label(
+            body,
+            text="Checked items are sent highest priority first. Face stays at #1.",
+        ).pack(anchor="w", pady=(5, 8))
+
+        configured = [
+            item.strip().lower()
+            for item in self.ai_target_priority.get().split(",")
+            if item.strip()
+        ]
+        priorities: list[dict[str, object]] = []
+        for item in ["face", *configured]:
+            if item not in [entry["name"] for entry in priorities]:
+                priorities.append({"name": item, "enabled": True})
+        selected_index = tk.IntVar(value=0)
+        rows = ttk.Frame(body)
+        rows.pack(fill=tk.X, pady=(0, 8))
+
+        def rebuild_rows() -> None:
+            for child in rows.winfo_children():
+                child.destroy()
+            for index, item in enumerate(priorities):
+                name = str(item["name"])
+                row = ttk.Frame(rows)
+                row.pack(fill=tk.X, pady=1)
+                ttk.Checkbutton(
+                    row,
+                    text=f"{index + 1}.",
+                    variable=item["variable"],
+                    command=lambda current=index: selected_index.set(current),
+                ).pack(side=tk.LEFT)
+                ttk.Button(
+                    row,
+                    text=name,
+                    command=lambda current=index: selected_index.set(current),
+                    width=24,
+                ).pack(side=tk.LEFT, padx=(4, 0))
+
+        for item in priorities:
+            item["variable"] = tk.BooleanVar(value=True)
+
+        rebuild_rows()
+
+        add_row = ttk.Frame(body)
+        add_row.pack(fill=tk.X, pady=(0, 10))
+        new_priority = tk.StringVar()
+        ttk.Entry(add_row, textvariable=new_priority, width=28).pack(
+            side=tk.LEFT,
+            fill=tk.X,
+            expand=True,
+        )
+
+        def add_priority() -> None:
+            name = new_priority.get().strip().lower()
+            if not name or any(str(item["name"]) == name for item in priorities):
+                return
+            priorities.append(
+                {"name": name, "enabled": True, "variable": tk.BooleanVar(value=True)}
+            )
+            new_priority.set("")
+            selected_index.set(len(priorities) - 1)
+            rebuild_rows()
+
+        ttk.Button(add_row, text="Add", command=add_priority).pack(
+            side=tk.LEFT,
+            padx=(6, 0),
+        )
+
+        reorder_row = ttk.Frame(body)
+        reorder_row.pack(fill=tk.X, pady=(0, 10))
+
+        def move_priority(direction: int) -> None:
+            index = selected_index.get()
+            new_index = index + direction
+            if index <= 0 or new_index >= len(priorities):
+                return
+            priorities[index], priorities[new_index] = (
+                priorities[new_index],
+                priorities[index],
+            )
+            selected_index.set(new_index)
+            rebuild_rows()
+
+        def delete_priority() -> None:
+            index = selected_index.get()
+            if index <= 0 or index >= len(priorities):
+                return
+            priorities.pop(index)
+            selected_index.set(max(0, index - 1))
+            rebuild_rows()
+
+        ttk.Button(reorder_row, text="Move up", command=lambda: move_priority(-1)).pack(
+            side=tk.LEFT,
+        )
+        ttk.Button(
+            reorder_row,
+            text="Move down",
+            command=lambda: move_priority(1),
+        ).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(reorder_row, text="Delete", command=delete_priority).pack(
+            side=tk.LEFT,
+            padx=(6, 0),
+        )
+
+        buttons = ttk.Frame(body)
+        buttons.pack(fill=tk.X)
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(
+            side=tk.RIGHT,
+            padx=(8, 0),
+        )
+        def save_priorities() -> None:
+            enabled_names = [
+                str(item["name"])
+                for item in priorities
+                if item["variable"].get()
+            ]
+            self.ai_target_priority.set(", ".join(enabled_names))
+            dialog.destroy()
+
+        ttk.Button(buttons, text="Save", command=save_priorities).pack(
+            side=tk.RIGHT,
+        )
+        dialog.update_idletasks()
+        dialog.geometry(
+            f"{dialog.winfo_reqwidth()}x{dialog.winfo_reqheight()}+"
+            f"{self.root.winfo_rootx() + 80}+{self.root.winfo_rooty() + 120}"
+        )
+        dialog.grab_set()
+
+    def _enable_ai_after_camera_start(self) -> None:
+        if not self.running or self.mode.get() != "Automatic AI":
+            return
+        self.ai_enabled.set(True)
+        self.ai_generation += 1
+        self._schedule_ai_requests(immediate=True)
+        self.mode_changed(update_status=False)
+        self.update_ai_indicator(True, "AI: ON • waiting for target")
+        self.status.set(
+            "AI enabled. Select an object in Source Camera, or choose Skip "
+            "to use AI priorities."
+        )
+        self._log("AI enabled automatically 1.5 seconds after camera startup.")
+        self.root.after(100, self._ask_for_ai_target)
+
+    def _ask_for_ai_target(self) -> None:
+        if not self.running or self.mode.get() != "Automatic AI":
+            return
+        select_target = messagebox.askyesno(
+            "Select AI target",
+            "Would you like to select an object now?\n\n"
+            "Yes: click the target in Source Camera.\n"
+            "No: AI will use the configured priorities.",
+            parent=self.root,
+        )
+        if select_target:
+            self.status.set(
+                "Click the target in Source Camera. AI will follow your selection."
+            )
+        else:
+            self.status.set(
+                "AI is using the configured target priorities."
+            )
 
     def _start_startup_checks(self) -> None:
         """Run hardware and model checks without blocking the Tk event loop."""
@@ -1851,6 +2607,138 @@ class PresenterCameraApp:
         self.startup_check_results.put((key, message))
         self._log(f"Startup check {key}: {message}")
 
+    @staticmethod
+    def _camera_selection_options(
+        webcam_indices: list[int],
+        stream_state: str,
+    ) -> tuple[str, ...]:
+        options = tuple(f"Webcam {index}" for index in webcam_indices)
+        if stream_state == "online":
+            options += ("Android stream",)
+        return options
+
+    def _show_camera_choices(
+        self,
+        webcam_indices: tuple[int, ...],
+        stream_state: str,
+    ) -> None:
+        if self.camera_dialog is not None and self.camera_dialog.winfo_exists():
+            return
+
+        options = self._camera_selection_options(list(webcam_indices), stream_state)
+        dialog = tk.Toplevel(self.root)
+        self.camera_dialog = dialog
+        dialog.title("Select camera")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+
+        body = ttk.Frame(dialog, padding=18)
+        body.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            body,
+            text="Startup camera check complete",
+            font=("Segoe UI", 12, "bold"),
+        ).pack(anchor="w")
+        ttk.Label(
+            body,
+            text="Choose the camera or stream you want to use:",
+        ).pack(anchor="w", pady=(5, 12))
+        mode_selection = tk.StringVar(
+            value=(
+                self.mode.get()
+                if self.mode.get() in {
+                    "Manual control",
+                    "Assisted tracking",
+                    "Face tracking",
+                    "Automatic AI",
+                }
+                else "Assisted tracking"
+            )
+        )
+
+        if not options:
+            ttk.Label(
+                body,
+                text="No usable camera feeds were found. Check camera permissions or connect a camera.",
+                wraplength=360,
+            ).pack(anchor="w", pady=(0, 12))
+        else:
+            selection = tk.StringVar(value=options[0])
+            camera_options = ttk.Frame(body)
+            camera_options.pack(fill=tk.X, pady=(0, 12))
+            for option in options:
+                ttk.Radiobutton(
+                    camera_options,
+                    text=option,
+                    variable=selection,
+                    value=option,
+                ).pack(anchor="w", pady=2)
+
+            ttk.Label(body, text="Tracking mode:").pack(anchor="w", pady=(4, 3))
+            mode_options = ttk.Frame(body)
+            mode_options.pack(fill=tk.X, pady=(0, 12))
+            for mode in (
+                "Manual control",
+                "Assisted tracking",
+                "Face tracking",
+                "Automatic AI",
+            ):
+                ttk.Radiobutton(
+                    mode_options,
+                    text=mode,
+                    variable=mode_selection,
+                    value=mode,
+                ).pack(anchor="w", pady=1)
+
+        buttons = ttk.Frame(body)
+        buttons.pack(fill=tk.X)
+
+        def close_dialog() -> None:
+            if self.camera_dialog is dialog:
+                self.camera_dialog = None
+            dialog.destroy()
+
+        def start_selected() -> None:
+            selected = selection.get()
+            if selected.startswith("Webcam "):
+                self.source_type.set("Webcam")
+                self.camera_index.set(selected.removeprefix("Webcam "))
+            else:
+                self.source_type.set("Android stream")
+            self.mode.set(mode_selection.get())
+            self.source_type_changed()
+            close_dialog()
+            self.start_source()
+            if mode_selection.get() == "Automatic AI" and self.running:
+                self.root.after(1500, self._enable_ai_after_camera_start)
+
+        if options:
+            ttk.Button(
+                buttons,
+                text="Okay",
+                command=start_selected,
+            ).pack(side=tk.RIGHT)
+        ttk.Button(
+            buttons,
+            text="Cancel" if options else "Close",
+            command=close_dialog,
+        ).pack(side=tk.RIGHT, padx=(0, 8) if options else (0, 0))
+        dialog.update_idletasks()
+        dialog_width = dialog.winfo_reqwidth()
+        dialog_height = dialog.winfo_reqheight()
+        root_x = self.root.winfo_rootx()
+        root_y = self.root.winfo_rooty()
+        root_width = self.root.winfo_width()
+        root_height = self.root.winfo_height()
+        dialog_x = root_x + max(0, (root_width - dialog_width) // 2)
+        dialog_y = root_y + max(0, (root_height - dialog_height) // 2)
+        dialog.geometry(
+            f"{dialog_width}x{dialog_height}+{dialog_x}+{dialog_y}"
+        )
+        dialog.grab_set()
+        dialog.focus_force()
+
     def _run_camera_feed_check(self, stream_url: str) -> None:
         webcam_indices: list[int] = []
         for index in STARTUP_CAMERA_INDICES:
@@ -1901,6 +2789,7 @@ class PresenterCameraApp:
             "cameras",
             f"Webcams {webcams}; Android stream {stream_state}.",
         )
+        self.camera_selection_results.put((tuple(webcam_indices), stream_state))
 
     def _run_local_cv_check(self) -> None:
         try:
@@ -1975,11 +2864,43 @@ class PresenterCameraApp:
         try:
             while True:
                 key, message = self.startup_check_results.get_nowait()
+                if self.startup_checks_cancelled:
+                    continue
                 status_var = self.startup_check_vars.get(key)
                 if status_var is not None:
                     status_var.set(message)
+                self.startup_checks_pending.discard(key)
+                if self.startup_overlay_status is not None:
+                    completed = 4 - len(self.startup_checks_pending)
+                    self.startup_overlay_status.set(
+                        f"Startup checks complete: {completed}/4"
+                    )
         except queue.Empty:
             pass
+        except tk.TclError:
+            return
+        if not self.startup_checks_pending:
+            self._hide_startup_overlay()
+
+    def _drain_camera_selection_results(self) -> None:
+        try:
+            while True:
+                webcam_indices, stream_state = (
+                    self.camera_selection_results.get_nowait()
+                )
+                if self.startup_checks_cancelled:
+                    continue
+                self.pending_camera_choices = (webcam_indices, stream_state)
+        except queue.Empty:
+            pass
+        except tk.TclError:
+            return
+        if self.startup_overlay is None and self.pending_camera_choices is not None:
+            webcam_indices, stream_state = self.pending_camera_choices
+            self.pending_camera_choices = None
+            self._show_camera_choices(webcam_indices, stream_state)
+        try:
+            self.root.after(150, self._drain_camera_selection_results)
         except tk.TclError:
             return
         try:
@@ -2063,9 +2984,97 @@ class PresenterCameraApp:
         if selected:
             self.video_path.set(selected)
 
+    def toggle_network_export(self) -> None:
+        if self.network_export is not None:
+            self.network_export.stop()
+            self.network_export = None
+            self.network_button.configure(text="Start network export")
+            self.network_status.set("Network export: OFF")
+            return
+
+        try:
+            port = int(self.network_port.get().strip())
+            if not 1 <= port <= 65535:
+                raise ValueError
+            server = NetworkExportServer(port=port)
+            server.start()
+        except (ValueError, OSError) as error:
+            self.network_status.set(f"Network export could not start: {error}")
+            return
+
+        self.network_export = server
+        self.network_button.configure(text="Stop network export")
+        self.network_status.set(
+            f"Video: http://localhost:{port}/\n"
+            f"Coordinates: http://localhost:{port}/coordinates\n"
+            f"Live stream: http://localhost:{port}/coordinates/stream"
+        )
+        self._log(f"Network export started on port {port}.")
+
+    def _update_network_export(
+        self,
+        virtual_frame: np.ndarray,
+        source_width: int,
+        source_height: int,
+        crop_left: int,
+        crop_top: int,
+        crop_width: int,
+        crop_height: int,
+    ) -> None:
+        if self.network_export is None:
+            return
+        ok, encoded = cv2.imencode(
+            ".jpg",
+            virtual_frame,
+            [int(cv2.IMWRITE_JPEG_QUALITY), 95],
+        )
+        if not ok:
+            return
+        center_x = crop_left + crop_width / 2
+        center_y = crop_top + crop_height / 2
+        coordinates = {
+            "source": {
+                "width": source_width,
+                "height": source_height,
+            },
+            "virtual_camera": {
+                "left": crop_left,
+                "top": crop_top,
+                "width": crop_width,
+                "height": crop_height,
+                "center_x": round(center_x, 2),
+                "center_y": round(center_y, 2),
+            },
+            "normalized": {
+                "center_x": round(center_x / source_width, 6),
+                "center_y": round(center_y / source_height, 6),
+            },
+            "motor": {
+                "pan": round((center_x / source_width) * 2 - 1, 6),
+                "tilt": round((center_y / source_height) * 2 - 1, 6),
+            },
+            "tracking": {
+                "local_tracker": self.tracker is not None,
+                "target_lost": self.tracking_lost,
+                "provider": self.ai_winner,
+            },
+            "frame": self.video_frame_count,
+            "target": {
+                "x": round(self.target_x, 2),
+                "y": round(self.target_y, 2),
+            },
+            "camera": {
+                "x": round(self.camera_x, 2),
+                "y": round(self.camera_y, 2),
+            },
+            "timestamp": time.time(),
+        }
+        self.network_export.update(encoded.tobytes(), coordinates)
+
     def start_source(self) -> None:
         self.camera_probe_cancel.set()
         self.stop_source(update_status=False)
+        selected_mode = self.mode.get()
 
         kind = self.source_type.get()
         capture = None
@@ -2107,7 +3116,7 @@ class PresenterCameraApp:
             self.frame = first_frame
             self.running = True
             self.clear_tracking(update_status=False)
-            self.mode.set("Assisted tracking")
+            self.mode.set(selected_mode)
             self.mode_changed(update_status=False)
             self.reset_camera(update_status=False)
             self.status.set(
@@ -2329,6 +3338,7 @@ class PresenterCameraApp:
         self.frame = frame
         self.video_frame_count += 1
         self._update_human_detection(frame)
+        self._maybe_start_human_tracking()
         self._drain_ai_results()
         height, width = frame.shape[:2]
 
@@ -2414,6 +3424,13 @@ class PresenterCameraApp:
         crop_width = min(crop_width, int(crop_height * aspect_ratio))
         crop_height = min(crop_height, int(crop_width / aspect_ratio))
 
+        # Keep compact head/face targets above center so the virtual crop
+        # includes the neck and shoulders instead of cutting them off.
+        if self.tracking_box is not None and not self.tracking_lost:
+            _, _, _, tracked_height = self.tracking_box
+            if tracked_height < crop_height * 0.70:
+                self.target_y += crop_height * PORTRAIT_VERTICAL_FRAMING_BIAS
+
         self.target_x = max(
             crop_width // 2,
             min(self.target_x, width - crop_width // 2),
@@ -2434,9 +3451,18 @@ class PresenterCameraApp:
         left = camera_x - crop_width // 2
         top = camera_y - crop_height // 2
 
-        virtual_frame = frame[top : top + crop_height, left : left + crop_width]
+        network_frame = frame[top : top + crop_height, left : left + crop_width]
+        self._update_network_export(
+            network_frame,
+            width,
+            height,
+            left,
+            top,
+            crop_width,
+            crop_height,
+        )
         virtual_frame = cv2.resize(
-            virtual_frame,
+            network_frame,
             (DISPLAY_WIDTH, DISPLAY_HEIGHT),
             interpolation=cv2.INTER_LINEAR,
         )
@@ -2574,21 +3600,60 @@ class PresenterCameraApp:
             )
 
     def show_frame(self, canvas: tk.Canvas, frame: np.ndarray, name: str) -> None:
+        canvas.update_idletasks()
+        canvas_width = canvas.winfo_width() or DISPLAY_WIDTH
+        canvas_height = canvas.winfo_height() or DISPLAY_HEIGHT
+        frame_height, frame_width = frame.shape[:2]
+        scale = min(
+            canvas_width / frame_width,
+            canvas_height / frame_height,
+        )
+        image_width = max(1, int(round(frame_width * scale)))
+        image_height = max(1, int(round(frame_height * scale)))
+        offset_x = (canvas_width - image_width) // 2
+        offset_y = (canvas_height - image_height) // 2
+
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(rgb_frame)
+        if (image_width, image_height) != image.size:
+            image = image.resize(
+                (image_width, image_height),
+                Image.Resampling.LANCZOS,
+            )
         photo = ImageTk.PhotoImage(image=image)
         canvas.delete("all")
-        canvas.create_image(0, 0, anchor=tk.NW, image=photo)
+        canvas.create_image(offset_x, offset_y, anchor=tk.NW, image=photo)
+        self.canvas_image_rectangles[name] = (
+            offset_x,
+            offset_y,
+            image_width,
+            image_height,
+        )
         if name == "source":
             self.source_image = photo
         else:
             self.virtual_image = photo
 
-    @staticmethod
-    def _canvas_point(event) -> tuple[int, int]:
+    def _canvas_point(self, event) -> tuple[int, int]:
+        left, top, image_width, image_height = self.canvas_image_rectangles.get(
+            "source",
+            (0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT),
+        )
         return (
-            max(0, min(int(event.x), DISPLAY_WIDTH - 1)),
-            max(0, min(int(event.y), DISPLAY_HEIGHT - 1)),
+            max(
+                0,
+                min(
+                    DISPLAY_WIDTH - 1,
+                    round((int(event.x) - left) * DISPLAY_WIDTH / image_width),
+                ),
+            ),
+            max(
+                0,
+                min(
+                    DISPLAY_HEIGHT - 1,
+                    round((int(event.y) - top) * DISPLAY_HEIGHT / image_height),
+                ),
+            ),
         )
 
     @staticmethod
@@ -2693,7 +3758,16 @@ class PresenterCameraApp:
         if self.frame is None:
             return
 
-        if not preserve_reference:
+        ai_target_selection = (
+            self.mode.get() == "Automatic AI"
+            and self.ai_enabled.get()
+        )
+        face_target_selection = self.mode.get() == "Face tracking"
+        if (
+            not preserve_reference
+            and not ai_target_selection
+            and not face_target_selection
+        ):
             self.mode.set("Assisted tracking")
             self.mode_changed(update_status=False)
         try:
@@ -2738,7 +3812,11 @@ class PresenterCameraApp:
                 target_kind="human" if self.track_human.get() else "generic",
             )
             self.status.set(
-                "Object selected. Reference captured and automatic follow enabled."
+                (
+                    "Object selected. AI remains active and will correct this target."
+                    if ai_target_selection
+                    else "Object selected. Reference captured and automatic follow enabled."
+                )
             )
         self._update_human_match()
 
@@ -2748,8 +3826,7 @@ class PresenterCameraApp:
             return
 
         frame_height, frame_width = self.frame.shape[:2]
-        click_x = max(0, min(event.x, DISPLAY_WIDTH - 1))
-        click_y = max(0, min(event.y, DISPLAY_HEIGHT - 1))
+        click_x, click_y = self._canvas_point(event)
         center_x = click_x * frame_width / DISPLAY_WIDTH
         center_y = click_y * frame_height / DISPLAY_HEIGHT
 
@@ -2827,6 +3904,9 @@ class PresenterCameraApp:
     def close(self) -> None:
         self.camera_probe_cancel.set()
         self.stop_source(update_status=False)
+        if self.network_export is not None:
+            self.network_export.stop()
+            self.network_export = None
         self.root.destroy()
 
 
