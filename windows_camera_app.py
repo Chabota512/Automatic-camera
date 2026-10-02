@@ -356,9 +356,6 @@ class PresenterCameraApp:
         self.smoothing = tk.DoubleVar(value=SMOOTHING_SPEED)
         self.follow_checkbutton: ttk.Checkbutton | None = None
         self.human_checkbutton: ttk.Checkbutton | None = None
-        self.header_status = tk.StringVar(value="READY  •  Select a source to begin")
-        self.status.trace_add("write", self._sync_header_status)
-
         self.build_menu()
         self.build_interface()
         self.bind_controls()
@@ -408,25 +405,6 @@ class PresenterCameraApp:
 
         self.root.configure(background="#eef2f7")
         style.configure("App.TFrame", background="#eef2f7")
-        style.configure("Header.TFrame", background="#172333")
-        style.configure(
-            "HeaderTitle.TLabel",
-            background="#172333",
-            foreground="#f8fafc",
-            font=("Segoe UI", 13, "bold"),
-        )
-        style.configure(
-            "HeaderSub.TLabel",
-            background="#172333",
-            foreground="#a9b8c9",
-            font=("Segoe UI", 9),
-        )
-        style.configure(
-            "HeaderStatus.TLabel",
-            background="#172333",
-            foreground="#8ee6c2",
-            font=("Consolas", 9, "bold"),
-        )
         style.configure(
             "SectionTitle.TLabel",
             background="#eef2f7",
@@ -439,16 +417,6 @@ class PresenterCameraApp:
             foreground="#64748b",
             font=("Segoe UI", 8),
         )
-
-    def _sync_header_status(self, *_args) -> None:
-        """Keep the compact header useful while the detailed status stays below."""
-        if not hasattr(self, "header_status"):
-            return
-        state = "LIVE" if self.running else "READY"
-        detail = self.status.get().strip()
-        if len(detail) > 72:
-            detail = f"{detail[:69]}..."
-        self.header_status.set(f"{state}  •  {detail}")
 
     def build_interface(self) -> None:
         # Keep the native Tk surface, but use a focused operator-console
@@ -541,31 +509,6 @@ class PresenterCameraApp:
             background=colors["panel"],
             troughcolor="#334039",
         )
-
-        header = tk.Frame(self.root, bg=colors["panel_alt"], height=56)
-        header.pack(fill=tk.X)
-        header.pack_propagate(False)
-        tk.Label(
-            header,
-            text="AUTOMATIC CAMERA",
-            bg=colors["panel_alt"],
-            fg=colors["lime"],
-            font=("Segoe UI", 12, "bold"),
-        ).pack(side=tk.LEFT, padx=(18, 8))
-        tk.Label(
-            header,
-            text="CONTROL ROOM  /  local camera operator console",
-            bg=colors["panel_alt"],
-            fg=colors["muted"],
-            font=("Segoe UI", 9),
-        ).pack(side=tk.LEFT)
-        tk.Label(
-            header,
-            textvariable=self.header_status,
-            bg=colors["panel_alt"],
-            fg=colors["lime"],
-            font=("Segoe UI", 9, "bold"),
-        ).pack(side=tk.RIGHT, padx=18)
 
         main = ttk.Frame(self.root, padding=(14, 12, 14, 0))
         main.pack(fill=tk.BOTH, expand=True)
