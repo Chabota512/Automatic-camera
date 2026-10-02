@@ -395,121 +395,20 @@ class PresenterCameraApp:
         self.root.config(menu=menu_bar)
 
     def _configure_style(self) -> None:
-        """Set a restrained Windows-console palette without replacing ttk controls."""
+        """Use the Windows ttk theme and preserve its native control appearance."""
         style = ttk.Style(self.root)
-        try:
-            if "vista" in style.theme_names():
-                style.theme_use("vista")
-        except tk.TclError:
-            pass
-
-        self.root.configure(background="#eef2f7")
-        style.configure("App.TFrame", background="#eef2f7")
-        style.configure(
-            "SectionTitle.TLabel",
-            background="#eef2f7",
-            foreground="#334155",
-            font=("Segoe UI", 9, "bold"),
-        )
-        style.configure(
-            "SectionHint.TLabel",
-            background="#eef2f7",
-            foreground="#64748b",
-            font=("Segoe UI", 8),
-        )
+        available_themes = style.theme_names()
+        for theme_name in ("vista", "xpnative", "winnative"):
+            if theme_name in available_themes:
+                try:
+                    style.theme_use(theme_name)
+                    break
+                except tk.TclError:
+                    continue
 
     def build_interface(self) -> None:
-        # Keep the native Tk surface, but use a focused operator-console
-        # palette instead of the platform default theme.
-        style = ttk.Style(self.root)
-        try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
-        colors = {
-            "bg": "#10171b",
-            "panel": "#192026",
-            "panel_alt": "#151d22",
-            "text": "#e5ebe7",
-            "muted": "#84958e",
-            "lime": "#c8f05a",
-            "coral": "#f27d59",
-            "line": "#34413d",
-        }
-        self.root.configure(background=colors["bg"])
-        style.configure(".", background=colors["bg"], foreground=colors["text"])
-        style.configure("TFrame", background=colors["bg"])
-        style.configure("Panel.TFrame", background=colors["panel"])
-        style.configure(
-            "TLabel",
-            background=colors["panel"],
-            foreground=colors["text"],
-            font=("Segoe UI", 9),
-        )
-        style.configure(
-            "Muted.TLabel",
-            background=colors["bg"],
-            foreground=colors["muted"],
-            font=("Segoe UI", 8),
-        )
-        style.configure(
-            "Section.TLabelframe",
-            background=colors["panel"],
-            foreground=colors["muted"],
-            bordercolor=colors["line"],
-            relief="solid",
-            borderwidth=1,
-        )
-        style.configure(
-            "Section.TLabelframe.Label",
-            background=colors["panel"],
-            foreground=colors["muted"],
-            font=("Segoe UI", 8, "bold"),
-        )
-        style.configure(
-            "TButton",
-            background="#26322f",
-            foreground=colors["text"],
-            bordercolor=colors["line"],
-            padding=(8, 5),
-        )
-        style.map(
-            "TButton",
-            background=[("active", "#33443d")],
-            foreground=[("disabled", "#61716a")],
-        )
-        style.configure(
-            "Accent.TButton",
-            background=colors["lime"],
-            foreground="#182019",
-            font=("Segoe UI", 9, "bold"),
-            padding=(9, 6),
-        )
-        style.map("Accent.TButton", background=[("active", "#d7fa79")])
-        style.configure(
-            "TEntry",
-            fieldbackground="#202b30",
-            foreground=colors["text"],
-            insertcolor=colors["text"],
-        )
-        style.configure(
-            "TCombobox",
-            fieldbackground="#202b30",
-            background="#26322f",
-            foreground=colors["text"],
-            arrowcolor=colors["lime"],
-        )
-        style.configure(
-            "TCheckbutton",
-            background=colors["panel"],
-            foreground=colors["text"],
-        )
-        style.configure(
-            "Horizontal.TScale",
-            background=colors["panel"],
-            troughcolor="#334039",
-        )
-
+        # Keep controls native; only the image previews use a black canvas.
+        app_background = self.root.cget("background")
         main = ttk.Frame(self.root, padding=(14, 12, 14, 0))
         main.pack(fill=tk.BOTH, expand=True)
         main.columnconfigure(0, weight=1)
@@ -524,7 +423,7 @@ class PresenterCameraApp:
         controls_canvas = tk.Canvas(
             controls_panel,
             width=315,
-            background=colors["bg"],
+            background=app_background,
             highlightthickness=0,
             borderwidth=0,
         )
@@ -540,7 +439,6 @@ class PresenterCameraApp:
         controls = ttk.Frame(
             controls_canvas,
             padding=(0, 0, 10, 0),
-            style="Panel.TFrame",
         )
         controls_window = controls_canvas.create_window(
             (0, 0),
@@ -610,9 +508,8 @@ class PresenterCameraApp:
 
         source_frame = ttk.LabelFrame(
             controls,
-            text="SOURCE SELECTION  /  INPUT",
+            text="Video source",
             padding=8,
-            style="Section.TLabelframe",
         )
         source_frame.pack(fill=tk.X)
         source_frame.columnconfigure(1, weight=1)
@@ -658,7 +555,6 @@ class PresenterCameraApp:
             source_buttons,
             text="Start",
             command=self.start_source,
-            style="Accent.TButton",
         )
         self.start_button.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.stop_button = ttk.Button(
@@ -700,9 +596,8 @@ class PresenterCameraApp:
 
         tracking_frame = ttk.LabelFrame(
             controls,
-            text="CONTROL MODE  /  TRACKING",
+            text="Tracking and AI",
             padding=8,
-            style="Section.TLabelframe",
         )
         tracking_frame.pack(fill=tk.X, pady=(10, 0))
         ttk.Label(tracking_frame, text="Operating mode:").pack(anchor="w")
@@ -849,9 +744,8 @@ class PresenterCameraApp:
 
         diagnostics_frame = ttk.LabelFrame(
             controls,
-            text="LAUNCH DIAGNOSTICS  /  HEALTH",
+            text="System checks",
             padding=6,
-            style="Section.TLabelframe",
         )
         diagnostics_frame.pack(fill=tk.X, pady=(10, 0))
         for key, label in (
@@ -877,9 +771,8 @@ class PresenterCameraApp:
 
         motion_frame = ttk.LabelFrame(
             controls,
-            text="CAMERA CONTROL  /  OPERATOR",
+            text="Camera controls",
             padding=8,
-            style="Section.TLabelframe",
         )
         motion_frame.pack(fill=tk.X, pady=(10, 0))
         ttk.Label(motion_frame, text="Smoothing speed:").pack(anchor="w")
@@ -922,144 +815,61 @@ class PresenterCameraApp:
             zoom_row, text="Zoom +", command=lambda: self.change_zoom(0.1)
         ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0))
 
-        displays = ttk.Frame(main, style="Panel.TFrame")
+        displays = ttk.Frame(main)
         displays.grid(row=0, column=0, sticky="nsew")
         displays.columnconfigure(0, weight=1)
         displays.columnconfigure(1, weight=1)
-        displays.rowconfigure(1, weight=1)
+        displays.rowconfigure(0, weight=1)
         main.rowconfigure(2, weight=0)
 
-        source_heading = tk.Frame(
-            displays,
-            bg=colors["panel"],
-            height=38,
-        )
-        source_heading.grid(
-            row=0,
-            column=0,
-            sticky="ew",
-            padx=(0, 6),
-            pady=(0, 4),
-        )
-        source_heading.pack_propagate(False)
-        tk.Label(
-            source_heading,
-            text="SOURCE CAMERA",
-            bg=colors["panel"],
-            fg=colors["lime"],
-            font=("Segoe UI", 10, "bold"),
-        ).pack(side=tk.LEFT, padx=12)
-        tk.Label(
-            source_heading,
-            text="INPUT / A     1080p  ·  LIVE",
-            bg=colors["panel"],
-            fg=colors["muted"],
-            font=("Consolas", 8),
-        ).pack(side=tk.RIGHT, padx=12)
-
-        output_heading = tk.Frame(
-            displays,
-            bg=colors["panel"],
-            height=38,
-        )
-        output_heading.grid(
-            row=0,
-            column=1,
-            sticky="ew",
-            padx=(6, 0),
-            pady=(0, 4),
-        )
-        output_heading.pack_propagate(False)
-        tk.Label(
-            output_heading,
-            text="VIRTUAL CAMERA OUTPUT",
-            bg=colors["panel"],
-            fg=colors["coral"],
-            font=("Segoe UI", 10, "bold"),
-        ).pack(side=tk.LEFT, padx=12)
-        tk.Label(
-            output_heading,
-            text="OUTPUT / VIRTUAL     60 FPS",
-            bg=colors["panel"],
-            fg=colors["muted"],
-            font=("Consolas", 8),
-        ).pack(side=tk.RIGHT, padx=12)
-
+        source_panel = ttk.LabelFrame(displays, text="Source camera", padding=6)
+        source_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        source_panel.columnconfigure(0, weight=1)
+        source_panel.rowconfigure(0, weight=1)
         self.source_canvas = tk.Canvas(
-            displays,
+            source_panel,
             width=DISPLAY_WIDTH // 2,
             height=DISPLAY_HEIGHT // 2,
-            background="#202b30",
-            highlightthickness=1,
-            highlightbackground="#52645d",
+            background="black",
+            highlightthickness=0,
+            borderwidth=0,
         )
-        self.source_canvas.grid(row=1, column=0, sticky="nsew", padx=(0, 5))
-        self.source_canvas.bind(
-            "<ButtonPress-1>",
-            self._on_source_button_press,
-        )
-        self.source_canvas.bind(
-            "<B1-Motion>",
-            self._on_source_mouse_drag,
-        )
-        self.source_canvas.bind(
-            "<ButtonRelease-1>",
-            self._on_source_button_release,
-        )
+        self.source_canvas.grid(row=0, column=0, sticky="nsew")
+        self.source_canvas.bind("<ButtonPress-1>", self._on_source_button_press)
+        self.source_canvas.bind("<B1-Motion>", self._on_source_mouse_drag)
+        self.source_canvas.bind("<ButtonRelease-1>", self._on_source_button_release)
 
+        output_panel = ttk.LabelFrame(
+            displays, text="Virtual camera output", padding=6
+        )
+        output_panel.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+        output_panel.columnconfigure(0, weight=1)
+        output_panel.rowconfigure(0, weight=1)
         self.virtual_canvas = tk.Canvas(
-            displays,
+            output_panel,
             width=DISPLAY_WIDTH // 2,
             height=DISPLAY_HEIGHT // 2,
-            background="#202b30",
-            highlightthickness=1,
-            highlightbackground="#52645d",
+            background="black",
+            highlightthickness=0,
+            borderwidth=0,
         )
-        self.virtual_canvas.grid(row=1, column=1, sticky="nsew", padx=(5, 0))
+        self.virtual_canvas.grid(row=0, column=0, sticky="nsew")
 
-        telemetry = tk.Frame(
-            displays,
-            bg=colors["panel"],
-            height=56,
+        preview_status = ttk.Frame(displays)
+        preview_status.grid(
+            row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0)
         )
-        telemetry.grid(
-            row=2,
-            column=0,
-            columnspan=2,
-            sticky="ew",
-            pady=(10, 0),
+        ttk.Label(preview_status, textvariable=self.target_status).pack(
+            side=tk.LEFT, anchor="w"
         )
-        telemetry.grid_propagate(False)
-        telemetry_items = (
-            ("TRACKING", "TARGET LOCKED", colors["lime"]),
-            ("CENTER OFFSET", "+02.4 px", colors["text"]),
-            ("MOVEMENT", "0.18 m/s  /  STABLE", colors["text"]),
-            ("LAST ANALYSIS", "240 ms AGO", colors["coral"]),
+        ttk.Label(preview_status, textvariable=self.human_status).pack(
+            side=tk.LEFT, anchor="w", padx=(16, 0)
         )
-        for index, (label, value, color) in enumerate(telemetry_items):
-            telemetry.columnconfigure(index, weight=1)
-            cell = tk.Frame(telemetry, bg=colors["panel"])
-            cell.grid(row=0, column=index, sticky="nsew", padx=10, pady=8)
-            tk.Label(
-                cell,
-                text=label,
-                bg=colors["panel"],
-                fg=colors["muted"],
-                font=("Segoe UI", 7, "bold"),
-            ).pack(anchor="w")
-            tk.Label(
-                cell,
-                text=value,
-                bg=colors["panel"],
-                fg=color,
-                font=("Consolas", 9, "bold"),
-            ).pack(anchor="w", pady=(3, 0))
 
         terminal_frame = ttk.LabelFrame(
             main,
-            text="LIVE DIAGNOSTICS  /  ALSO PRINTED TO POWERSHELL OR CMD",
+            text="Diagnostics",
             padding=4,
-            style="Section.TLabelframe",
         )
         terminal_frame.grid(
             row=2,
@@ -1073,11 +883,9 @@ class PresenterCameraApp:
         self.terminal = tk.Text(
             terminal_frame,
             height=8,
-            background="#101318",
-            foreground="#b8f5c8",
-            insertbackground="#b8f5c8",
-            font=("Consolas", 9),
-            relief=tk.FLAT,
+            font="TkFixedFont",
+            relief=tk.SUNKEN,
+            borderwidth=1,
             state=tk.DISABLED,
             wrap=tk.NONE,
         )
@@ -1090,28 +898,11 @@ class PresenterCameraApp:
         terminal_scrollbar.grid(row=0, column=1, sticky="ns")
         self.terminal.configure(yscrollcommand=terminal_scrollbar.set)
 
-        footer = tk.Frame(
-            self.root,
-            bg=colors["panel_alt"],
-            height=30,
-        )
-        footer.pack(fill=tk.X, side=tk.BOTTOM)
-        footer.pack_propagate(False)
-        tk.Label(
-            footer,
-            textvariable=self.status,
-            bg=colors["panel_alt"],
-            fg=colors["muted"],
-            anchor="w",
-            font=("Consolas", 8),
-        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=14)
-        tk.Label(
-            footer,
-            text="LOCAL PROCESSING  ·  NET 46 MS  ·  BUILD 0.9.4-BETA",
-            bg=colors["panel_alt"],
-            fg=colors["muted"],
-            font=("Consolas", 8),
-        ).pack(side=tk.RIGHT, padx=14)
+        status_bar = ttk.Frame(self.root, padding=(14, 5))
+        status_bar.pack(fill=tk.X, side=tk.BOTTOM)
+        ttk.Label(
+            status_bar, textvariable=self.status, anchor="w"
+        ).pack(fill=tk.X)
 
         self.source_type_changed()
         self.mode_changed(update_status=False)
